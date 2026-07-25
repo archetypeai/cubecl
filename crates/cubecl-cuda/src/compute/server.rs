@@ -60,6 +60,49 @@ fn cuda_check(op: &str, status: cudarc::driver::sys::CUresult) -> Result<(), Ser
 /// Build a [`ServerError`] for a graph-capture call issued in the wrong state
 /// (e.g. `begin_capture` without `graph_prepare`, or a second overlapping
 /// capture on the same stream).
+/// Count the memory-allocation/free nodes recorded in `graph`.
+///
+/// A captured graph is only replayable if it owns no memory nodes: CUDA refuses to relaunch a
+/// graph whose allocation nodes have not been freed. Every allocation the capture window needs
+/// must therefore be served by the already-warmed persistent pool — the window growing the pool
+/// is precisely the condition this detects.
+///
+/// # Safety
+///
+/// `graph` must be a valid, not-yet-destroyed `CUgraph`.
+unsafe fn count_memory_nodes(graph: cudarc::driver::sys::CUgraph) -> usize {
+    let mut num_nodes: usize = 0;
+    if cudarc::driver::sys::cuGraphGetNodes(graph, std::ptr::null_mut(), &mut num_nodes)
+        != cudarc::driver::sys::CUresult::CUDA_SUCCESS
+    {
+        return 0;
+    }
+    let mut nodes: Vec<cudarc::driver::sys::CUgraphNode> = vec![std::ptr::null_mut(); num_nodes];
+    let mut num_read = num_nodes;
+    if cudarc::driver::sys::cuGraphGetNodes(graph, nodes.as_mut_ptr(), &mut num_read)
+        != cudarc::driver::sys::CUresult::CUDA_SUCCESS
+    {
+        return 0;
+    }
+    nodes
+        .iter()
+        .take(num_read)
+        .filter(|node| {
+            let mut ty = cudarc::driver::sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL;
+            if cudarc::driver::sys::cuGraphNodeGetType(**node, &mut ty)
+                != cudarc::driver::sys::CUresult::CUDA_SUCCESS
+            {
+                return false;
+            }
+            matches!(
+                ty,
+                cudarc::driver::sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_ALLOC
+                    | cudarc::driver::sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_FREE
+            )
+        })
+        .count()
+}
+
 fn graph_state_error(reason: impl Into<String>) -> ServerError {
     ServerError::Generic {
         reason: reason.into(),
@@ -321,6 +364,13 @@ impl ComputeServer for CudaServer {
         let sys = stream.sys;
         stream.drop_queue.flush(|| Fence::new(sys));
         stream.drop_queue.flush(|| Fence::new(sys));
+        // Warmup is over: release the slices it retained (see `CaptureState::primed`) so they are
+        // free for the recorded run to reuse. The pool now holds warmup's full distinct working
+        // set rather than its transient peak, so the window has nothing left to allocate — and an
+        // allocation inside the window would record a memory node, which makes the graph
+        // un-relaunchable. Must happen here, after warmup and before the window opens.
+        stream.memory_management_gpu.capture_priming_end();
+        stream.memory_management_cpu.capture_priming_end();
         // SAFETY: `stream.sys` is a valid CUDA stream; global capture mode
         // records every launch issued on it until `cuStreamEndCapture`.
         let status = unsafe {
@@ -387,6 +437,21 @@ impl ComputeServer for CudaServer {
                     cudarc::driver::sys::cuStreamEndCapture(stream.sys, &mut graph),
                 )
                 .and_then(|_| {
+                    // A capture that recorded a memory node is unusable: the graph allocates on
+                    // launch and never frees, so the driver rejects every relaunch with
+                    // `CUDA_ERROR_INVALID_VALUE` while the first launch quietly succeeds. Reject
+                    // it here instead, so the caller falls back to eager execution rather than
+                    // failing on its second replay. `cuGraphUpload` does NOT catch this — it
+                    // returns `CUDA_SUCCESS` for such graphs.
+                    let alloc_nodes = count_memory_nodes(graph);
+                    if alloc_nodes > 0 {
+                        cudarc::driver::sys::cuGraphDestroy(graph);
+                        return Err(graph_state_error(format!(
+                            "capture recorded {alloc_nodes} memory node(s): an allocation inside \
+                             the capture window makes the graph un-relaunchable, so the capture \
+                             is rejected (the persistent pool should have served this allocation)"
+                        )));
+                    }
                     let mut exec: cudarc::driver::sys::CUgraphExec = std::ptr::null_mut();
                     let instantiated = cuda_check(
                         "cuGraphInstantiateWithFlags",

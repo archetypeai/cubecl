@@ -74,6 +74,55 @@ fn cuda_graph_capture_replay() {
     assert_eq!(f32::from_bytes(&out), &[2.0, 3.0, 4.0, 5.0]);
 }
 
+/// A capture window that has to grow the memory pool must be REJECTED, not handed back.
+///
+/// A stream-ordered allocation (`cuMemAllocAsync`) issued while recording is captured as a memory
+/// node, and a graph holding an allocation node it never frees cannot be relaunched: the first
+/// `cuGraphLaunch` succeeds and every later one fails with `CUDA_ERROR_INVALID_VALUE`. Nothing
+/// else catches this — instantiation succeeds and `cuGraphUpload` returns `CUDA_SUCCESS` — so a
+/// caller that trusted `stop_capture` would only discover it on its second replay, far from the
+/// cause. Warmup usually leaves the persistent pool able to serve the recorded run, so real
+/// workloads hit the growth path only intermittently; this forces it by allocating a size the pool
+/// has never seen inside the window.
+#[test]
+fn cuda_graph_capture_growing_the_pool_is_rejected() {
+    let _guard = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let client = CudaRuntime::client(&Default::default());
+
+    let n = 4usize;
+    let input = client.create_from_slice(f32::as_bytes(&[1.0, 2.0, 3.0, 4.0]));
+    let output = client.empty(n * core::mem::size_of::<f32>());
+
+    let launch = |client: &ComputeClient<CudaRuntime>| {
+        add_one::launch::<CudaRuntime>(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new(client, n),
+            unsafe { BufferArg::from_raw_parts(input.clone(), n) },
+            unsafe { BufferArg::from_raw_parts(output.clone(), n) },
+        );
+    };
+
+    client.graph_prepare().expect("graph_prepare");
+    launch(&client);
+    let _ = client.read_one(output.clone()).unwrap();
+
+    client.start_capture().expect("start_capture");
+    launch(&client);
+    // Force the pool to grow mid-capture: this deliberately odd size has never been allocated on
+    // this client, so no free slice fits it and the storage must reach the device allocator.
+    let grown = client.empty(3_145_733);
+    let rejected = client.stop_capture();
+
+    assert!(
+        rejected.is_err(),
+        "a capture that grew the pool recorded a memory node and is not relaunchable, so \
+         stop_capture must reject it rather than return a graph that fails on its second replay"
+    );
+
+    drop(grown);
+}
+
 /// The input-rewrite path: a captured graph reads its input buffer at replay
 /// time, so writing new bytes into that same buffer (same device pointer) and
 /// replaying must produce output for the new input. This is how a decode loop
