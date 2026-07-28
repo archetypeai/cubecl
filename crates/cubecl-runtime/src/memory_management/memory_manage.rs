@@ -146,6 +146,20 @@ struct CaptureState {
     /// so a slice the window never touched is not over-retained, and a
     /// pre-existing slice freed and reused mid-window is still pinned.
     touched: HashSet<ManagedMemoryId>,
+    /// Whether the warmup (priming) phase is still running, i.e. the capture window has not opened
+    /// yet. While set, every slice handed out is retained in `primed` instead of being recycled.
+    priming: bool,
+    /// Slices retained during priming, released by
+    /// [`capture_priming_end`](MemoryManagement::capture_priming_end).
+    ///
+    /// Warmup exists to leave the pool able to serve the recorded run without allocating — an
+    /// allocation inside the window is recorded as a memory node, and CUDA refuses to relaunch a
+    /// graph holding one. Letting warmup recycle its own slices defeats that: the pool only ever
+    /// grows to a warmup pass's transient *peak*, which depends on how far the host runs ahead of
+    /// the device and can land below what the recorded run asks for. Holding every slice instead
+    /// forces the pool up to the pass's full distinct working set — an upper bound on any peak —
+    /// so once these are released the recorded run cannot ask for a slice the pool lacks.
+    primed: Vec<ManagedMemoryHandle>,
 }
 
 fn generate_bucket_sizes(
@@ -708,9 +722,26 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
             self.capture = Some(CaptureState {
                 restore_mode: self.mode,
                 touched: HashSet::new(),
+                priming: true,
+                primed: Vec::new(),
             });
         }
         self.mode = MemoryAllocationMode::Persistent;
+    }
+
+    /// End the priming phase and release the slices warmup retained, returning them to the pool as
+    /// free. Call immediately before the capture window opens.
+    ///
+    /// After this the pool holds every slice a warmup pass touched, all of them free, so the
+    /// recorded run reuses them instead of growing the pool (see [`CaptureState::primed`]). No-op
+    /// when no capture is active or priming already ended.
+    pub fn capture_priming_end(&mut self) {
+        if let Some(capture) = &mut self.capture {
+            capture.priming = false;
+            // Dropping the handles makes the slices free again; the slices themselves stay in the
+            // pool, which is the point.
+            capture.primed.clear();
+        }
     }
 
     /// End a graph capture: restore the previous allocation mode and return a
@@ -872,6 +903,11 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
     fn capture_touch(&mut self, handle: &ManagedMemoryHandle) {
         if let Some(capture) = &mut self.capture {
             capture.touched.insert(handle.descriptor().id);
+            if capture.priming {
+                // Retain it so warmup cannot recycle this slice, forcing the pool to grow to the
+                // pass's full working set rather than its transient peak.
+                capture.primed.push(handle.clone());
+            }
         }
     }
 
