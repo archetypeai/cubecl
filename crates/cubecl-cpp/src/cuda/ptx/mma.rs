@@ -97,12 +97,14 @@ fn ldmatrix(
     row: *const u32,
     #[comptime] num: usize,
     #[comptime] transpose: &str,
+    #[comptime] open: &str,
+    #[comptime] close: &str,
 ) -> Vector<u32, NCD> {
     let row_addr = generic_to_shared::<u32>(row);
 
     let out: Vector<u32, NCD>;
     gpu_asm!(
-        "ldmatrix.sync.aligned.m8n8.x{num}{transpose}.shared::cta.b16 {out}, [{addr}];",
+        "ldmatrix.sync.aligned.m8n8.x{num}{transpose}.shared::cta.b16 {open}{out}{close}, [{addr}];",
         out = out(_) out, addr = in(_) row_addr, options(readonly),
     );
     out
@@ -199,9 +201,24 @@ impl LowerOp<Cuda> for LdMatrixOp {
         let factor = self.factor(ctx).0;
         let trans = if self.transpose(ctx).0 { ".trans" } else { "" };
 
+        // PTX writes `ldmatrix`'s destination as a vector operand at EVERY width, `.x1`
+        // included. The operand here is `Vector<u32, NCD>`, and a width-1 `Vector` lowers to
+        // its scalar type (`frontend/container/vector/base.rs`: `if vectorization > 1`), so the
+        // placeholder substitution takes the scalar branch and emits a bare `%0` where ptxas
+        // demands `{%0}` -- *"Vector of size 1 is expected for argument 0 of instruction
+        // 'ldmatrix'"*. That collapse is right everywhere else and is not the thing to change;
+        // the braces belong here, where the arity is known. `StMatrixOp::lower` below never hit
+        // this because it builds its `VectorType` explicitly rather than through the frontend
+        // type.
+        //
+        // Only `.x1` is affected, which is why this survived: the B fragment of `m16n8k8` is
+        // essentially the sole producer, i.e. Turing f16. Every sm_80+ card takes `.x2`/`.x4`
+        // and is correct already.
+        let (open, close) = if factor == 1 { ("{", "}") } else { ("", "") };
+
         scope.register_size::<NCD>(factor);
 
-        let frag_out = ldmatrix::expand(scope, &row_ptr, factor, trans);
+        let frag_out = ldmatrix::expand(scope, &row_ptr, factor, trans, open, close);
         let frag_out =
             reinterpret_value(scope, frag_out.read_value(scope), out_arr.unwrap_ptr(ctx));
         assign::expand_element(scope, frag_out.into(), out_arr.into());
